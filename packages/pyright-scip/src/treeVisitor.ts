@@ -16,6 +16,7 @@ import {
     ImportFromAsNode,
     ImportFromNode,
     ImportNode,
+    MemberAccessNode,
     ModuleNameNode,
     ModuleNode,
     NameNode,
@@ -33,7 +34,7 @@ import { Position } from './lsif-typescript/Position';
 import { Range } from './lsif-typescript/Range';
 import { ScipConfig } from './lib';
 import * as ParseTreeUtils from 'pyright-internal/analyzer/parseTreeUtils';
-import { ClassType, Type, TypeCategory } from 'pyright-internal/analyzer/types';
+import { ClassType, Type, TypeCategory, isInstantiableClass } from 'pyright-internal/analyzer/types';
 import * as Types from 'pyright-internal/analyzer/types';
 import { TypeStubExtendedWriter } from './TypeStubExtendedWriter';
 import { SourceFile } from 'pyright-internal/analyzer/sourceFile';
@@ -322,6 +323,42 @@ export class TreeVisitor extends ParseTreeWalker {
             }
         }
 
+        // Handle instance attribute assignments: self.attr = value
+        // Emit a definition symbol for the attribute on the enclosing class.
+        if (node.leftExpression.nodeType === ParseNodeType.MemberAccess) {
+            const memberAccess = node.leftExpression as MemberAccessNode;
+            const leftType = this.evaluator.getTypeOfExpression(memberAccess.leftExpression);
+
+            if (Types.isClassInstance(leftType.type)) {
+                const classType = leftType.type;
+                const classPkg = this.guessPackage(classType.details.moduleName, classType.details.filePath);
+                if (classPkg) {
+                    const classSym = Symbols.makeClass(classPkg, classType.details.moduleName, classType.details.name);
+                    const attrName = memberAccess.memberName.value;
+                    const attrSymbol = Symbols.makeTerm(classSym, attrName);
+
+                    // Determine if this is the first assignment (definition) for this attribute.
+                    // Treat assignments in __init__ as definitions; others as references.
+                    const enclosingFunc = ParseTreeUtils.getEnclosingFunction(node);
+                    const isInInit = enclosingFunc && enclosingFunc.name.value === '__init__';
+                    const role = isInInit ? scip.SymbolRole.Definition : scip.SymbolRole.WriteAccess;
+
+                    this.pushNewOccurrence(memberAccess.memberName, attrSymbol, role);
+
+                    // Emit symbol information for definitions
+                    if (isInInit) {
+                        const hoverResult = this.program.getHoverForPosition(
+                            this.fileInfo!.filePath,
+                            convertOffsetToPosition(memberAccess.memberName.start, this.fileInfo!.lines),
+                            'markdown',
+                            _cancellationToken
+                        );
+                        this.emitSymbolInformationOnce(memberAccess.memberName, attrSymbol, hoverResult ? _formatHover(hoverResult) : undefined);
+                    }
+                }
+            }
+        }
+
         return true;
     }
 
@@ -395,6 +432,14 @@ export class TreeVisitor extends ParseTreeWalker {
                 relationships,
             })
         );
+
+        // If the function has decorators, emit an implicit reference to the function.
+        // This ensures that decorator-registered functions (e.g., @app.get("/path") handlers,
+        // @pytest.fixture, @classmethod, etc.) are not incorrectly reported as dead code.
+        if (node.decorators.length > 0) {
+            const funcSymbol = this.getScipSymbol(node);
+            this.pushNewOccurrence(node.name, funcSymbol, scip.SymbolRole.ReadAccess);
+        }
 
         // Since we are manually handling various aspects, we need to make sure that we handle
         // - decorators
@@ -840,15 +885,23 @@ export class TreeVisitor extends ParseTreeWalker {
                 softAssert(false, "I don't think that this should be possible");
                 break;
 
-            // Without a declaration, it doesn't seem useful to try and add member accesses
-            // with locals. You'll just get a new local for every reference because we can't construct
-            // what these are.
-            //
-            // In the future, it could be possible that we could store what locals we have generated for a file
-            // (for example `unknown_module.access`, and then use the same local for all of them, but it would be quite
-            // difficult in my mind).
-            case ParseNodeType.MemberAccess:
+            // Try to resolve member accesses using type evaluation even when Pyright
+            // doesn't provide explicit declarations (e.g., self.attr on instance attributes).
+            case ParseNodeType.MemberAccess: {
+                const memberAccessParent = parent as MemberAccessNode;
+                if (memberAccessParent.memberName.id === node.id) {
+                    // This name node IS the member name (the right side of the dot).
+                    // Try to resolve via the type of the left expression.
+                    const symbol = this.resolveClassMemberSymbol(memberAccessParent, node);
+                    if (symbol) {
+                        this.pushNewOccurrence(node, symbol);
+                        return true;
+                    }
+                }
+                // Fall through — emit as local if we can't resolve
+                this.pushNewOccurrence(node, this.getLocalForDeclaration(node));
                 return true;
+            }
         }
 
         log.debug('    NO DECL:', ParseTreeUtils.printParseNodeType, parent.nodeType);
@@ -1077,8 +1130,39 @@ export class TreeVisitor extends ParseTreeWalker {
                 );
             }
             case ParseNodeType.MemberAccess: {
-                softAssert(false, 'Not supposed to get a member access');
-                return ScipSymbol.empty();
+                // Resolve member accesses (e.g., self.method, obj.attr) by evaluating
+                // the type of the left-hand expression and looking up the member.
+                const memberNode = node as MemberAccessNode;
+                const leftType = this.evaluator.getTypeOfExpression(memberNode.leftExpression);
+                const memberName = memberNode.memberName.value;
+
+                // Handle both class instances (self.method) and instantiable classes (MyClass.method)
+                if (leftType.type.category === TypeCategory.Class) {
+                    const classType = leftType.type as ClassType;
+                    const classPkg = this.guessPackage(classType.details.moduleName, classType.details.filePath);
+                    if (classPkg) {
+                        const classSym = Symbols.makeClass(classPkg, classType.details.moduleName, classType.details.name);
+                        const member = lookUpClassMember(classType, memberName);
+                        if (member) {
+                            const memberDecls = member.symbol.getDeclarations();
+                            if (memberDecls.length > 0 && memberDecls[0].type === DeclarationType.Function) {
+                                return Symbols.makeMethod(classSym, memberName);
+                            }
+                        }
+                        return Symbols.makeTerm(classSym, memberName);
+                    }
+                } else if (Types.isModule(leftType.type)) {
+                    const modulePkg = this.guessPackage(leftType.type.moduleName);
+                    if (modulePkg) {
+                        return Symbols.makeTerm(
+                            Symbols.makeModule(modulePkg, leftType.type.moduleName),
+                            memberName
+                        );
+                    }
+                }
+
+                // Fallback: could not resolve, use local
+                return ScipSymbol.local(this.counter.next());
             }
             case ParseNodeType.Parameter: {
                 if (!node.name) {
@@ -1117,28 +1201,70 @@ export class TreeVisitor extends ParseTreeWalker {
                 switch (parent.nodeType) {
                     case ParseNodeType.MemberAccess: {
                         const type = this.evaluator.getTypeOfExpression(parent.leftExpression);
-                        switch (type.type.category) {
-                            case TypeCategory.TypeVar: {
-                                const typeVar = type.type;
-                                const bound = typeVar.details.boundType! as ClassType;
 
-                                return this.getSymbolOnce(node, () => {
-                                    const pythonPackage = this.getPackageInfo(node, bound.details.moduleName)!;
-                                    let symbol = Symbols.makeTerm(
-                                        Symbols.makeType(
-                                            Symbols.makeModule(pythonPackage, bound.details.moduleName),
-                                            bound.details.name
-                                        ),
-                                        node.value
-                                    );
-
-                                    // TODO: We might not want to do this if it's not the definition?
+                        // Handle class instances (self.method) and instantiable classes (MyClass.method)
+                        if (type.type.category === TypeCategory.Class) {
+                            const classType = type.type as ClassType;
+                            return this.getSymbolOnce(node, () => {
+                                const classPkg = this.guessPackage(classType.details.moduleName, classType.details.filePath);
+                                if (classPkg) {
+                                    const classSym = Symbols.makeClass(classPkg, classType.details.moduleName, classType.details.name);
+                                    const member = lookUpClassMember(classType, node.value);
+                                    let symbol: ScipSymbol;
+                                    if (member) {
+                                        const memberDecls = member.symbol.getDeclarations();
+                                        if (memberDecls.length > 0 && memberDecls[0].type === DeclarationType.Function) {
+                                            symbol = Symbols.makeMethod(classSym, node.value);
+                                        } else {
+                                            symbol = Symbols.makeTerm(classSym, node.value);
+                                        }
+                                    } else {
+                                        symbol = Symbols.makeTerm(classSym, node.value);
+                                    }
                                     this.emitSymbolInformationOnce(node, symbol);
                                     return symbol;
-                                });
-                            }
-                            default:
+                                }
+                                return ScipSymbol.local(this.counter.next());
+                            });
                         }
+
+                        // Handle module access (e.g., os.path)
+                        if (type.type.category === TypeCategory.Module) {
+                            const modType = type.type;
+                            return this.getSymbolOnce(node, () => {
+                                const modulePkg = this.guessPackage(modType.moduleName);
+                                if (modulePkg) {
+                                    const symbol = Symbols.makeTerm(
+                                        Symbols.makeModule(modulePkg, modType.moduleName),
+                                        node.value
+                                    );
+                                    this.emitSymbolInformationOnce(node, symbol);
+                                    return symbol;
+                                }
+                                return ScipSymbol.local(this.counter.next());
+                            });
+                        }
+
+                        // Handle TypeVar (existing behavior)
+                        if (type.type.category === TypeCategory.TypeVar) {
+                            const typeVar = type.type;
+                            const bound = typeVar.details.boundType! as ClassType;
+
+                            return this.getSymbolOnce(node, () => {
+                                const pythonPackage = this.getPackageInfo(node, bound.details.moduleName)!;
+                                let symbol = Symbols.makeTerm(
+                                    Symbols.makeType(
+                                        Symbols.makeModule(pythonPackage, bound.details.moduleName),
+                                        bound.details.name
+                                    ),
+                                    node.value
+                                );
+
+                                this.emitSymbolInformationOnce(node, symbol);
+                                return symbol;
+                            });
+                        }
+                        break;
                     }
                 }
 
@@ -1669,6 +1795,37 @@ export class TreeVisitor extends ParseTreeWalker {
         let firstPart = nameParts[0];
         if (Hardcoded.stdlib_module_names.has(firstPart)) {
             return this.stdlibPackage;
+        }
+
+        return undefined;
+    }
+
+    /**
+     * Resolve a member access (e.g., self.method, obj.attr) to a SCIP symbol
+     * by evaluating the type of the left expression and looking up the member.
+     */
+    private resolveClassMemberSymbol(memberAccess: MemberAccessNode, nameNode: NameNode): ScipSymbol | undefined {
+        const leftType = this.evaluator.getTypeOfExpression(memberAccess.leftExpression);
+        const memberName = nameNode.value;
+
+        let classType: ClassType | undefined;
+        if (leftType.type.category === TypeCategory.Class) {
+            classType = leftType.type as ClassType;
+        }
+
+        if (classType) {
+            const classPkg = this.guessPackage(classType.details.moduleName, classType.details.filePath);
+            if (classPkg) {
+                const classSym = Symbols.makeClass(classPkg, classType.details.moduleName, classType.details.name);
+                const member = lookUpClassMember(classType, memberName);
+                if (member) {
+                    const memberDecls = member.symbol.getDeclarations();
+                    if (memberDecls.length > 0 && memberDecls[0].type === DeclarationType.Function) {
+                        return Symbols.makeMethod(classSym, memberName);
+                    }
+                }
+                return Symbols.makeTerm(classSym, memberName);
+            }
         }
 
         return undefined;
