@@ -1,6 +1,6 @@
 {
     "name": "scip-python-plus",
-    "version": "0.7.0",
+    "version": "0.7.2",
     "description": "Enhanced SCIP indexer for Python with full self.method(), instance attribute, and decorator support",
     "main": "index.js",
     "scripts": {

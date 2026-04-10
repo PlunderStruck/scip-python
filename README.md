@@ -1,148 +1,93 @@
-# scip-python
+# scip-python-plus
 
-Sourcegraph fork of [pyright](https://github.com/microsoft/pyright) focused on generating [SCIP](https://github.com/sourcegraph/scip) for python projects.
+Enhanced fork of [scip-python](https://github.com/sourcegraph/scip-python) with full support for `self.method()` calls, instance attributes, and decorated functions.
 
-Project is primarily an addition to Pyright. At this time, there are no substantial changes to the `pyright` library.
+Built on [Pyright](https://github.com/microsoft/pyright) for generating [SCIP](https://github.com/sourcegraph/scip) indexes from Python projects.
 
-## Pre-requisites
+## What's different from upstream scip-python?
 
-scip-python only supports Python 3.10+.
+The original scip-python silently drops all `MemberAccess` nodes, which means:
 
+- `self.method()` calls produce no cross-references
+- `self.attribute` access is invisible to the index
+- Decorated functions (e.g., `@app.get`, `@pytest.fixture`) show as dead code
+
+**scip-python-plus fixes all of this:**
+
+| Feature | scip-python | scip-python-plus |
+|---|---|---|
+| `self.method()` calls | Not tracked | Fully resolved via Pyright type evaluator |
+| `self.attribute` access | Not tracked | Tracked as references |
+| Instance attribute definitions (`self.x = ...` in `__init__`) | Not emitted | Emitted as definition symbols |
+| Decorated functions (`@app.get`, `@route`) | Reported as dead code | Implicit reference prevents false positives |
+| Static/class method access (`MyClass.method()`) | Not tracked | Fully resolved |
+| Module member access (`os.path`) | Not tracked | Resolved via module type |
+
+## Install
+
+```bash
+npm install -g scip-python-plus
 ```
-$ # Install scip-python
-$ npm install -g @sourcegraph/scip-python
-```
 
-scip-python requires Node v16 or newer. See the [Dockerfile](https://github.com/sourcegraph/scip-python/blob/scip/Dockerfile.autoindex) for an exact SHA that is tested.
+Requires Node v16+ and Python 3.10+.
 
-scip-python uses `pip` to attempt to determine the versions and names of the packages available in your environment. If you do not use pip to install the packages, you can instead use the `--environment` flag to supply a list of packages to use as the environment. This will skip any calls out to pip to determine the state of your env. See [Environment](##-environment) for more information.
-
+Used automatically by [scip-query](https://github.com/PlunderStruck/scip-query) when indexing Python projects.
 
 ## Usage
 
-```
-$ npm install @sourcegraph/scip-python
+```bash
+# Activate your virtual environment first
+scip-python index . --project-name=my-project --project-version=0.1.0
 
-$ # NOTE: make sure to activate your virtual environment before running
-$ scip-python index . --project-name=$MY_PROJECT
+# Convert to SQLite for scip-query
+scip expt-convert --output index.db index.scip
 
-$ # Make sure to point towards the sourcegraph instance you're interested in uploading to.
-$ #     more information at https://github.com/sourcegraph/src-cli
-$ src code-intel upload
-```
-
-If you hit an out-of-memory error, increase the memory limit using the environment variable `NODE_OPTIONS="--max-old-space-size=8192"` to increase the heap size limit to 8GB (or higher, if needed).
-
-### target-only
-
-To run scip-python over only a particular directory, you can use the `--target-only` flag. Example:
-
-```
-$ scip-python index . --project-name=$MY_PROJECT --target-only=src/subdir
+# Query the index
+scip-query dead
+scip-query call-graph my_function
+scip-query refs my_function
 ```
 
-### project-namespace
-
-Additionally, if your project is loaded with some prefix, you can use the `--project-namespace` to put a namespace before all the generated symbols for this project.
-
-```
-$ scip-python index . --project-name=$MY_PROJECT --project-namespace=implicit.namespace
+If you hit an out-of-memory error, increase the heap size:
+```bash
+NODE_OPTIONS="--max-old-space-size=8192" scip-python index . --project-name=my-project
 ```
 
-Now all symbols will have `implicit.namespace` prepended to their symbol, so that you can use it for cross repository navigation, even if the directory structure in your current project does not explicitly show `implicit/namespace/myproject/__init__.py`.
+### Options
 
-## Environment
+```bash
+# Index only a specific subdirectory
+scip-python index . --project-name=my-project --target-only=src/subdir
 
-The environment file format is a JSON list of `PythonPackage`s. The `PythonPackage` has the following form:
+# Add a namespace prefix to all symbols
+scip-python index . --project-name=my-project --project-namespace=implicit.namespace
 
-```json
-{
-    "name": "PyYAML",
-    "version": "6.0",
-    "files": [
-      "PyYAML-6.0.dist-info/INSTALLER",
-      ...
-      "yaml/__init__.py",
-      "yaml/composer.py",
-      "yaml/tokens.py",
-      ...
-    ]
-},
+# Supply a custom environment file (skips pip detection)
+scip-python index . --project-name=my-project --environment=path/to/env.json
 ```
 
-Where:
-- `name`:
-  - The name of the package. Often times this is the same as the module, but is not always the case.
-  - For example, `PyYAML` is the name of the package, but the module is `yaml` (i.e. `import yaml`).
-- `version`:
-  - The vesion of the package. This is used to generate stable references to external packages.
-- `files`:
-  - A list of all the files that are a member of this package.
-  - Some packages declare multiple modules, so these should all be included.
+## Environment file format
 
-The environment file should be a list of these packages:
+If you don't use pip, supply a JSON file listing your packages:
 
 ```json
 [
-  { "name": "PyYAML", "version": "6.0", "files": [...] },
-  { "name": "pytorch", "version": "3.0", "files": [..] },
-  ...
+  {
+    "name": "PyYAML",
+    "version": "6.0",
+    "files": [
+      "yaml/__init__.py",
+      "yaml/composer.py",
+      "yaml/tokens.py"
+    ]
+  }
 ]
 ```
 
-To use the environment file, you should call scip-python like so:
+## Technical details
 
-```
-$ scip-python index --project-name=$MY_PROJECT --environment=path/to/env.json
-```
+All changes are in `packages/pyright-scip/src/treeVisitor.ts`. The key fix: the original code returned `ScipSymbol.empty()` for all `MemberAccess` parse nodes. This fork resolves them using Pyright's `TypeEvaluator.getTypeOfExpression()` and `lookUpClassMember()`, which already have full type information — it just wasn't being used for SCIP emission.
 
-If you're just using pip, this should not be required. We should calculate this from the pip environment. If you experience any bugs, please report them. The goal is that we support standard pip installation without additional configuration. If there is other python tooling that can generate this information, you can file an issue and we'll see if we can support it as well.
+## Upstream
 
-## Sourcegraph Example Configuration
-
-Using the usage example above may be quite simple to add a CI pipeline (perhaps using the `sourcegraph/scip-python:autoindex`) image
-and uploading the corresponding index.scip file to Sourcegraph only for commits that you are intersted in (whether that's only HEAD
-or every branch).
-
-However, if you're interested in using the Auto-Indexing feature, an example configuration skeleton can be found below:
-
-```
-{
-    "index_jobs": [
-        {
-            "indexer": "sourcegraph/scip-python:autoindex",
-            "local_steps": [
-                "pip install . || true",
-            ],
-            "indexer_args": [
-              "scip-python", "index", ".",
-              "--project-name", "<your name here>",
-              "--project-version", "_"
-            ],
-            "steps": [],
-            "outfile": "",
-            "root": ""
-        }
-    ],
-    "shared_steps": []
-}
-```
-
-## To compare upstream from pyright
-
-You can go to the following [Sourcegraph
-link](https://sourcegraph.com/github.com/sourcegraph/scip-python/-/compare/pyright-mirror...scip)
-to compare the changes we've made from pyright.
-
-The changes are almost exclusively in the folder `packages/pyright-scip/` and various `package.json` files
-due to adding some additional dependencies.
-
-In general, we've tried to make very little changes to anything inside of the pyright packages.
-The only changes that are inside there at this point are:
-- Not bail out of indexing if it's taking a long time
-- Not throw away indexed files if memory usage gets high
-- Allow parsing of some additional files
-
-## Contributing
-
-See [pyright-scip/CONTRIBUTING.md](./packages/pyright-scip/CONTRIBUTING.md).
+Based on [sourcegraph/scip-python](https://github.com/sourcegraph/scip-python). Upstream changes to Pyright internals are minimal (3 patches for indexing stability).
