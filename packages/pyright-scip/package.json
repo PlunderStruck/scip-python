@@ -1,6 +1,6 @@
 {
     "name": "scip-python-plus",
-    "version": "0.7.4",
+    "version": "0.7.5",
     "description": "Enhanced SCIP indexer for Python with full self.method(), instance attribute, and decorator support",
     "main": "index.js",
     "scripts": {
@@ -29,7 +29,6 @@
         "@sourcegraph/tsconfig": "4.0.1",
         "@types/command-exists": "^1.2.0",
         "@types/diff": "^5.0.2",
-        "@types/glob": "^7.2.0",
         "@types/google-protobuf": "^3.15.5",
         "@types/jest": "^27.5.0",
         "@types/ora": "^3.2.0",
@@ -50,7 +49,6 @@
         "command-exists": "^1.2.9",
         "commander": "^9.2.0",
         "diff": "^5.0.0",
-        "glob": "^7.2.0",
         "google-protobuf": "^3.19.3",
         "ts-node": "^10.5.0",
         "vscode-languageserver": "^7.0.0"
