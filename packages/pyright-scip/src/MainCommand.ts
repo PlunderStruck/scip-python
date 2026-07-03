@@ -1,4 +1,5 @@
 import { Command, InvalidArgumentError } from 'commander';
+import path from 'path';
 import packageJson from '../package.json';
 
 export interface IndexOptions {
@@ -48,7 +49,12 @@ export function mainCommand(
     environmentAction?: (options: EnvironmentOptions) => void
 ): Command {
     const command = new Command();
-    command.name('scip-python').version(packageJson.version).description('SCIP indexer for Python');
+    const invokedName = process.argv[1] ? path.basename(process.argv[1]) : 'scip-python-plus';
+    const commandName = invokedName === 'scip-python' || invokedName === 'scip-python-plus' ? invokedName : 'scip-python-plus';
+    command
+        .name(commandName)
+        .version(packageJson.version)
+        .description('SCIP indexer for Python');
 
     command
         .command('index')
